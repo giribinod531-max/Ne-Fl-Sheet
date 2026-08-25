@@ -1,0 +1,245 @@
+name: 04 - Daily NEPSE Update
+run-name: Daily NEPSE update ${{ inputs.start_date || 'scheduled' }}
+
+on:
+  schedule:
+    - cron: "15 18 * * *"
+      timezone: "Asia/Kathmandu"
+    - cron: "45 23 * * *"
+      timezone: "Asia/Kathmandu"
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Optional start date (YYYY-MM-DD); blank means today in Nepal"
+        required: false
+        type: string
+      end_date:
+        description: "Optional end date (maximum 7 calendar days)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-nepse-download
+  cancel-in-progress: false
+
+jobs:
+  prepare-dates:
+    runs-on: ubuntu-latest
+    outputs:
+      dates: ${{ steps.dates.outputs.dates }}
+      final_attempt: ${{ steps.dates.outputs.final_attempt }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_SCHEDULE: ${{ github.event.schedule }}
+      START_INPUT: ${{ inputs.start_date }}
+      END_INPUT: ${{ inputs.end_date }}
+
+    steps:
+      - name: Select Nepal dates
+        id: dates
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          event_schedule = os.environ.get("EVENT_SCHEDULE", "")
+          start_text = os.environ.get("START_INPUT", "").strip()
+          end_text = os.environ.get("END_INPUT", "").strip()
+          now_nepal = datetime.now(ZoneInfo("Asia/Kathmandu"))
+
+          if event_name == "workflow_dispatch" and start_text:
+              try:
+                  start = date.fromisoformat(start_text)
+                  end = date.fromisoformat(end_text) if end_text else start
+              except ValueError as exc:
+                  raise SystemExit("Manual dates must use YYYY-MM-DD format.") from exc
+          else:
+              target = now_nepal.date()
+              if event_schedule == "45 23 * * *" and now_nepal.hour < 6:
+                  target -= timedelta(days=1)
+              start = end = target
+
+          days = (end - start).days + 1
+          if days < 1:
+              raise SystemExit("End date cannot be before start date.")
+          if days > 7:
+              raise SystemExit("Manual daily recovery is limited to 7 calendar days.")
+          if end > now_nepal.date():
+              raise SystemExit("Future Nepal dates cannot be downloaded.")
+
+          selected = [
+              (start + timedelta(days=offset)).isoformat()
+              for offset in range(days)
+          ]
+          final_attempt = (
+              event_name == "workflow_dispatch" or event_schedule == "45 23 * * *"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"dates={json.dumps(selected, separators=(',', ':'))}\n")
+              output.write(f"final_attempt={str(final_attempt).lower()}\n")
+          print("Selected Nepal dates:", ", ".join(selected))
+          print("Final attempt:", final_attempt)
+          PY
+
+  download-daily:
+    name: Download ${{ matrix.target_date }}
+    needs: prepare-dates
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        target_date: ${{ fromJSON(needs.prepare-dates.outputs.dates) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_DATE: ${{ matrix.target_date }}
+      FINAL_ATTEMPT: ${{ needs.prepare-dates.outputs.final_attempt }}
+
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@v6
+
+      - name: Check whether the date is already saved
+        id: existing
+        shell: bash
+        run: |
+          tag="nepse-daily-${TARGET_DATE:0:7}"
+          data_asset="nepse-data-${TARGET_DATE}.zip"
+          no_data_asset="nepse-no-data-${TARGET_DATE}.json"
+          names=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' 2>/dev/null || true)
+          if grep -Fxq "$data_asset" <<< "$names" || \
+             grep -Fxq "$no_data_asset" <<< "$names"; then
+            echo "saved=true" >> "$GITHUB_OUTPUT"
+            echo "$TARGET_DATE is already stored. Nothing will be downloaded."
+          else
+            echo "saved=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.existing.outputs.saved != 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python packages and browser
+        if: steps.existing.outputs.saved != 'true'
+        run: |
+          python -m pip install --requirement requirements-daily.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Check the daily project files
+        if: steps.existing.outputs.saved != 'true'
+        run: |
+          python -m py_compile floorsheet_downloader.py
+          python -m py_compile price_csv_downloader.py
+          python -m py_compile daily_nepse_runner.py
+          python -m unittest discover -s tests -v
+          python price_csv_downloader.py --self-test
+          python daily_nepse_runner.py --self-test
+
+      - name: Download floorsheet and official price table
+        id: download
+        if: steps.existing.outputs.saved != 'true'
+        continue-on-error: true
+        run: >-
+          python daily_nepse_runner.py
+          --date "$TARGET_DATE"
+          --output-dir output
+          --delay 1.5
+
+      - name: Read daily validation status
+        id: status
+        if: steps.existing.outputs.saved != 'true'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("output") / os.environ["TARGET_DATE"] / "daily_status.json"
+          if not path.is_file():
+              overall = "MISSING"
+          else:
+              overall = str(json.loads(path.read_text())["overall_status"])
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"overall={overall}\n")
+          print("Overall status:", overall)
+          PY
+
+      - name: Create the monthly GitHub Release when needed
+        if: >-
+          steps.existing.outputs.saved != 'true' &&
+          (steps.status.outputs.overall == 'READY' ||
+          (steps.status.outputs.overall == 'SOURCE_GAP' && env.FINAL_ATTEMPT == 'true') ||
+          (steps.status.outputs.overall == 'NO_DATA' && env.FINAL_ATTEMPT == 'true'))
+        run: |
+          tag="nepse-daily-${TARGET_DATE:0:7}"
+          month="${TARGET_DATE:0:7}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Daily NEPSE Data - $month" \
+              --notes "Validated daily NEPSE floorsheet and official price files for $month."
+
+      - name: Publish a validated daily data package
+        if: >-
+          steps.existing.outputs.saved != 'true' &&
+          (steps.status.outputs.overall == 'READY' ||
+          (steps.status.outputs.overall == 'SOURCE_GAP' && env.FINAL_ATTEMPT == 'true'))
+        run: |
+          tag="nepse-daily-${TARGET_DATE:0:7}"
+          gh release upload "$tag" \
+            "output/release_assets/nepse-data-${TARGET_DATE}.zip" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish final non-trading-day marker
+        if: >-
+          steps.existing.outputs.saved != 'true' &&
+          steps.status.outputs.overall == 'NO_DATA' &&
+          env.FINAL_ATTEMPT == 'true'
+        run: |
+          tag="nepse-daily-${TARGET_DATE:0:7}"
+          gh release upload "$tag" \
+            "output/release_assets/nepse-no-data-${TARGET_DATE}.json" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Save temporary diagnostic artifact
+        if: always() && steps.existing.outputs.saved != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: daily-nepse-${{ matrix.target_date }}-run-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+      - name: Apply final quality result
+        if: steps.existing.outputs.saved != 'true'
+        run: |
+          status="${{ steps.status.outputs.overall }}"
+          if [[ "$status" == "MISSING" ]]; then
+            echo "The daily status report was not created."
+            exit 1
+          fi
+          if [[ "$status" == "INCOMPLETE" && "$FINAL_ATTEMPT" == "true" ]]; then
+            echo "The final attempt is incomplete. Review the temporary artifact."
+            exit 1
+          fi
+          if [[ "$status" == "SOURCE_GAP" && "$FINAL_ATTEMPT" != "true" ]]; then
+            echo "The primary run found a source gap; the backup run will retry."
+          elif [[ "$status" == "NO_DATA" && "$FINAL_ATTEMPT" != "true" ]]; then
+            echo "The primary run found no data; the backup run will retry."
+          elif [[ "$status" == "INCOMPLETE" ]]; then
+            echo "The primary run was incomplete; the backup run will retry."
+          else
+            echo "Daily processing finished with status: $status"
+          fi
