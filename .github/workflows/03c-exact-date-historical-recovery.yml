@@ -1,0 +1,278 @@
+name: 03C - Exact-Date Historical Recovery
+run-name: Recover 147 verified missing historical dates
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ne-fl-sheet-download
+  cancel-in-progress: false
+
+jobs:
+  prepare-recovery:
+    name: Validate recovery plan
+    runs-on: ubuntu-latest
+    outputs:
+      dates: ${{ steps.dates.outputs.dates }}
+
+    steps:
+      - name: Build the exact recovery date list
+        id: dates
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from collections import Counter
+          from datetime import date, timedelta
+
+          # These ranges came from the independent audit of all 17 Stage 3
+          # artifacts. Fridays and Saturdays are removed below.
+          ranges = [
+              ("2025-02-27", "2025-02-27"),
+              ("2025-03-25", "2025-03-31"),
+              ("2025-06-30", "2025-06-30"),
+              ("2025-07-23", "2025-07-31"),
+              ("2025-08-31", "2026-02-24"),
+              ("2026-03-01", "2026-03-01"),
+              ("2026-03-29", "2026-03-31"),
+              ("2026-04-28", "2026-04-30"),
+          ]
+
+          # These February dates already have final Stage 3 results and must
+          # never be downloaded by this recovery workflow.
+          excluded = {
+              "2026-02-20",
+              "2026-02-21",
+              "2026-02-22",
+              "2026-02-23",
+          }
+
+          selected = []
+          for start_text, end_text in ranges:
+              current = date.fromisoformat(start_text)
+              end = date.fromisoformat(end_text)
+              while current <= end:
+                  text = current.isoformat()
+                  if current.weekday() not in {4, 5} and text not in excluded:
+                      selected.append(text)
+                  current += timedelta(days=1)
+
+          if len(selected) != 147:
+              raise SystemExit(f"Expected 147 recovery dates, received {len(selected)}.")
+          if len(selected) != len(set(selected)):
+              raise SystemExit("Duplicate recovery dates were generated.")
+          if selected != sorted(selected):
+              raise SystemExit("Recovery dates are not in chronological order.")
+          if any(date.fromisoformat(item).weekday() in {4, 5} for item in selected):
+              raise SystemExit("A Friday or Saturday entered the recovery list.")
+          if excluded.intersection(selected):
+              raise SystemExit("A previously completed date entered the recovery list.")
+
+          counts = Counter(item[:7] for item in selected)
+          print("Recovery dates:", len(selected))
+          for month, count in sorted(counts.items()):
+              print(f"  {month}: {count}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"dates={json.dumps(selected, separators=(',', ':'))}\n")
+          PY
+
+      - name: Get repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install required packages
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run downloader validation tests once
+        run: |
+          python -m py_compile floorsheet_downloader.py
+          python -m unittest discover -s tests -v
+
+  recover-date:
+    name: Recover ${{ matrix.target_date }}
+    needs: prepare-recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        target_date: ${{ fromJSON(needs.prepare-recovery.outputs.dates) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_DATE: ${{ matrix.target_date }}
+
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@v4
+
+      - name: Check whether the recovered date is already saved
+        id: existing
+        shell: bash
+        run: |
+          tag="nepse-historical-recovery-${TARGET_DATE:0:7}"
+          names=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' 2>/dev/null || true)
+          saved=false
+          for asset in \
+            "historical-floorsheet-${TARGET_DATE}.zip" \
+            "historical-source-gap-${TARGET_DATE}.zip" \
+            "historical-no-data-${TARGET_DATE}.json"; do
+            if grep -Fxq "$asset" <<< "$names"; then
+              saved=true
+            fi
+          done
+          echo "saved=$saved" >> "$GITHUB_OUTPUT"
+          if [[ "$saved" == "true" ]]; then
+            echo "$TARGET_DATE is already stored. The date will be skipped."
+          fi
+
+      - name: Set up Python
+        if: steps.existing.outputs.saved != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install required packages
+        if: steps.existing.outputs.saved != 'true'
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Download and validate one historical date
+        id: download
+        if: steps.existing.outputs.saved != 'true'
+        continue-on-error: true
+        run: >-
+          python floorsheet_downloader.py
+          --start-date "$TARGET_DATE"
+          --end-date "$TARGET_DATE"
+          --output-dir output
+          --delay 1.5
+
+      - name: Read the validated result
+        id: status
+        if: steps.existing.outputs.saved != 'true'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("output/validation_summary.json")
+          if not path.is_file():
+              status = "MISSING"
+          else:
+              summary = json.loads(path.read_text(encoding="utf-8"))
+              results = summary.get("results", [])
+              if len(results) != 1:
+                  status = "MISSING"
+              else:
+                  status = str(results[0].get("status", "MISSING"))
+          print("Validated status:", status)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"value={status}\n")
+          PY
+
+      - name: Prepare a permanent recovery asset
+        if: >-
+          steps.existing.outputs.saved != 'true' &&
+          steps.status.outputs.value != 'FAILED' &&
+          steps.status.outputs.value != 'MISSING'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          target = os.environ["TARGET_DATE"]
+          status = "${{ steps.status.outputs.value }}"
+          root = Path("output")
+          assets = root / "release_assets"
+          assets.mkdir(parents=True, exist_ok=True)
+
+          if status == "NOT_AVAILABLE":
+              marker = {
+                  "date": target,
+                  "status": status,
+                  "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "source": "https://www.merolagani.com/Floorsheet.aspx",
+                  "message": "No floorsheet rows were returned for this recovery date.",
+              }
+              path = assets / f"historical-no-data-{target}.json"
+              path.write_text(json.dumps(marker, indent=2), encoding="utf-8")
+          else:
+              prefix = (
+                  "historical-source-gap" if status == "REJECT"
+                  else "historical-floorsheet"
+              )
+              path = assets / f"{prefix}-{target}.zip"
+              with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                  for source in sorted(root.rglob("*")):
+                      if not source.is_file() or "release_assets" in source.parts:
+                          continue
+                      archive.write(source, source.relative_to(root))
+          print("Prepared asset:", path)
+          PY
+
+      - name: Create the monthly historical recovery Release when needed
+        if: >-
+          steps.existing.outputs.saved != 'true' &&
+          steps.status.outputs.value != 'FAILED' &&
+          steps.status.outputs.value != 'MISSING'
+        run: |
+          tag="nepse-historical-recovery-${TARGET_DATE:0:7}"
+          month="${TARGET_DATE:0:7}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Historical NEPSE Recovery - $month" \
+              --notes "Validated recovery results for previously failed or timed-out historical floorsheet dates in $month."
+
+      - name: Publish the permanent recovery asset
+        if: >-
+          steps.existing.outputs.saved != 'true' &&
+          steps.status.outputs.value != 'FAILED' &&
+          steps.status.outputs.value != 'MISSING'
+        run: |
+          tag="nepse-historical-recovery-${TARGET_DATE:0:7}"
+          gh release upload "$tag" output/release_assets/* \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Save a temporary diagnostic artifact
+        if: always() && steps.existing.outputs.saved != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-recovery-${{ matrix.target_date }}-run-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+      - name: Apply the final recovery result
+        if: steps.existing.outputs.saved != 'true'
+        run: |
+          status="${{ steps.status.outputs.value }}"
+          if [[ "$status" == "FAILED" || "$status" == "MISSING" || -z "$status" ]]; then
+            echo "$TARGET_DATE was not recovered because of a technical failure."
+            exit 1
+          fi
+          if [[ "$status" == "REJECT" ]]; then
+            echo "$TARGET_DATE was saved as a source-gap file and must be excluded from exact broker analysis."
+          else
+            echo "$TARGET_DATE finished with status: $status"
+          fi
+
+      - name: Cool down before the next historical date
+        if: always() && steps.existing.outputs.saved != 'true'
+        run: sleep 45
