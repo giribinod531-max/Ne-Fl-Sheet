@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.create.outputs.matrix }}
+      through_date: ${{ steps.create.outputs.through_date }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -40,6 +41,8 @@ jobs:
             --start-year '${{ inputs.start_year }}' \
             --end-year '${{ inputs.end_year }}')"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          through_date="$(python -c 'import json,sys; print(json.loads(sys.argv[1])[-1]["end_date"])' "$matrix")"
+          echo "through_date=$through_date" >> "$GITHUB_OUTPUT"
 
   download:
     name: ${{ matrix.batch.batch_id }}
@@ -72,11 +75,15 @@ jobs:
         timeout-minutes: 330
         shell: bash
         run: |
+          mkdir -p backfill_output/logs
+          set +e
           python canonical_floorsheet_downloader.py \
             --start-date '${{ matrix.batch.start_date }}' \
             --end-date '${{ matrix.batch.end_date }}' \
             --output-dir backfill_output \
-            --delay 1.5
+            --delay 1.5 2>&1 | tee backfill_output/logs/console.log
+          downloader_exit=${PIPESTATUS[0]}
+          exit "$downloader_exit"
 
       - name: Independently audit canonical CSV files
         id: audit
@@ -131,7 +138,8 @@ jobs:
             --input-dir collected \
             --output-dir yearly_packages \
             --start-year '${{ inputs.start_year }}' \
-            --end-year '${{ inputs.end_year }}'
+            --end-year '${{ inputs.end_year }}' \
+            --through-date '${{ needs.plan.outputs.through_date }}'
 
       - name: Upload yearly bulk ZIP files
         uses: actions/upload-artifact@v4
