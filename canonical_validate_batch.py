@@ -68,11 +68,17 @@ def decimal_value(value: str, label: str) -> Decimal:
         raise ValidationError(f"Invalid {label}: {value!r}.") from exc
 
 
+def broker_value_is_valid(value: str) -> bool:
+    value = value.strip()
+    return bool(re.fullmatch(r"[0-9]+", value)) and int(value) > 0
+
+
 def validate_csv(path: Path, requested: str, expected_rows: int) -> dict[str, object]:
     row_count = 0
     transaction_ids: set[str] = set()
     total_quantity = 0
     total_amount = Decimal("0")
+    broker_anomaly_rows = 0
     expected_prefix = requested.replace("-", "")
 
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -103,6 +109,10 @@ def validate_csv(path: Path, requested: str, expected_rows: int) -> dict[str, ob
                 raise ValidationError(f"{path.name}: non-positive value at row {row_count}.")
             if abs((Decimal(quantity) * rate) - amount) > Decimal("0.01"):
                 raise ValidationError(f"{path.name}: quantity × rate mismatch at row {row_count}.")
+            if not broker_value_is_valid(row["Buyer"]) or not broker_value_is_valid(
+                row["Seller"]
+            ):
+                broker_anomaly_rows += 1
             total_quantity += quantity
             total_amount += amount
 
@@ -115,6 +125,7 @@ def validate_csv(path: Path, requested: str, expected_rows: int) -> dict[str, ob
         "rows": row_count,
         "quantity": total_quantity,
         "amount": str(total_amount),
+        "broker_anomaly_rows": broker_anomaly_rows,
     }
 
 
@@ -129,7 +140,14 @@ def run(output_dir: Path, start: date, end: date) -> dict[str, object]:
         if expected_rows:
             if not csv_path.is_file():
                 raise ValidationError(f"{requested}: expected CSV is missing.")
-            checked.append(validate_csv(csv_path, requested, expected_rows))
+            checked_result = validate_csv(csv_path, requested, expected_rows)
+            reported_anomalies = int(quality.get("broker_anomaly_rows") or 0)
+            if checked_result["broker_anomaly_rows"] != reported_anomalies:
+                raise ValidationError(
+                    f"{requested}: independently counted broker anomalies do not "
+                    "match quality_report.csv."
+                )
+            checked.append(checked_result)
         elif csv_path.exists():
             raise ValidationError(f"{requested}: unexpected empty-day CSV exists.")
 
@@ -151,6 +169,7 @@ def run(output_dir: Path, start: date, end: date) -> dict[str, object]:
         "status_counts": status_counts,
         "validated_csv_files": len(checked),
         "validated_rows": sum(item["rows"] for item in checked),
+        "broker_anomaly_rows": sum(item["broker_anomaly_rows"] for item in checked),
         "result": "PASS",
     }
 
