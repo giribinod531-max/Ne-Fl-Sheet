@@ -48,8 +48,8 @@ class FloorsheetError(RuntimeError):
 class Transaction:
     transaction_no: str
     symbol: str
-    buyer: int
-    seller: int
+    buyer: str
+    seller: str
     quantity: int
     rate: Decimal
     amount: Decimal
@@ -100,6 +100,24 @@ class DownloadResult:
         return sum((row.amount for row in self.transactions), Decimal("0"))
 
     @property
+    def broker_anomaly_rows(self) -> int:
+        return sum(
+            not broker_value_is_valid(row.buyer)
+            or not broker_value_is_valid(row.seller)
+            for row in self.transactions
+        )
+
+    @property
+    def broker_anomaly_values(self) -> tuple[str, ...]:
+        values: set[str] = set()
+        for row in self.transactions:
+            if not broker_value_is_valid(row.buyer):
+                values.add(f"Buyer={row.buyer!r}")
+            if not broker_value_is_valid(row.seller):
+                values.add(f"Seller={row.seller!r}")
+        return tuple(sorted(values))
+
+    @property
     def missing_records(self) -> int:
         return self.expected_records - self.actual_records
 
@@ -118,10 +136,28 @@ def clean_text(value: str) -> str:
 
 def parse_integer(value: str) -> int:
     cleaned = clean_text(value).replace(",", "")
-    number = Decimal(cleaned)
+    try:
+        number = Decimal(cleaned)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Expected an integer, received {value!r}") from exc
     if number != number.to_integral_value():
         raise ValueError(f"Expected an integer, received {value!r}")
     return int(number)
+
+
+def normalize_broker(value: str) -> str:
+    """Normalize numeric brokers; preserve any source marker without invention."""
+    cleaned = clean_text(value)
+    try:
+        broker = parse_integer(cleaned)
+    except ValueError:
+        return cleaned
+    return str(broker)
+
+
+def broker_value_is_valid(value: str) -> bool:
+    value_text = str(value).strip()
+    return bool(re.fullmatch(r"[0-9]+", value_text)) and int(value_text) > 0
 
 
 def parse_decimal(value: str) -> Decimal:
@@ -233,8 +269,8 @@ def extract_transactions(soup: Any, page_number: int) -> list[Transaction]:
             transaction = Transaction(
                 transaction_no=values[1],
                 symbol=values[2].upper(),
-                buyer=parse_integer(values[3]),
-                seller=parse_integer(values[4]),
+                buyer=normalize_broker(values[3]),
+                seller=normalize_broker(values[4]),
                 quantity=parse_integer(values[5]),
                 rate=parse_decimal(values[6]),
                 amount=parse_decimal(values[7]),
@@ -377,6 +413,11 @@ def classify_quality(
     actual_records = len(transactions)
     actual_quantity = sum(row.quantity for row in transactions)
     actual_amount = sum((row.amount for row in transactions), Decimal("0"))
+    broker_anomaly_rows = sum(
+        not broker_value_is_valid(row.buyer)
+        or not broker_value_is_valid(row.seller)
+        for row in transactions
+    )
     differences = (
         expected_records - actual_records,
         expected_quantity - actual_quantity,
@@ -395,19 +436,37 @@ def classify_quality(
         and quantity_difference == 0
         and amount_is_equal
         and not short_pages
+        and broker_anomaly_rows == 0
     ):
         return "COMPLETE", "All rows, quantity and amount match the displayed totals."
 
+    broker_anomaly_ratio = Decimal(broker_anomaly_rows) / Decimal(expected_records)
     ratios = (
         Decimal(records_difference) / Decimal(expected_records),
         Decimal(quantity_difference) / Decimal(expected_quantity),
         amount_difference / expected_amount,
+        broker_anomaly_ratio,
     )
     if max(ratios) <= MINOR_GAP_LIMIT:
+        if broker_anomaly_rows:
+            return (
+                "MINOR_GAP",
+                f"The source contains {broker_anomaly_rows:,} row(s) with a missing "
+                "or non-numeric broker identifier. The original values are preserved; "
+                "every measured quality difference is at most 0.10%.",
+            )
         return (
             "MINOR_GAP",
             "The source omitted a small number of rows; every measured difference "
             "is at most 0.10% and is recorded in the quality report.",
+        )
+    if broker_anomaly_ratio > MINOR_GAP_LIMIT:
+        return (
+            "REJECT",
+            f"The source contains {broker_anomaly_rows:,} row(s) with a missing or "
+            "non-numeric broker identifier, above the safe 0.10% limit. The "
+            "original values are preserved, but do not use this day for exact "
+            "broker analysis.",
         )
     return (
         "REJECT",
@@ -552,6 +611,29 @@ def download_one_date(
         transactions,
         short_pages,
     )
+    broker_anomaly_rows = sum(
+        not broker_value_is_valid(row.buyer)
+        or not broker_value_is_valid(row.seller)
+        for row in transactions
+    )
+    if broker_anomaly_rows:
+        anomaly_values = sorted(
+            {
+                value
+                for row in transactions
+                for value in (
+                    f"Buyer={row.buyer!r}" if not broker_value_is_valid(row.buyer) else "",
+                    f"Seller={row.seller!r}" if not broker_value_is_valid(row.seller) else "",
+                )
+                if value
+            }
+        )
+        logging.warning(
+            "%s | preserved %s broker-anomaly row(s) | values=%s",
+            requested.isoformat(),
+            broker_anomaly_rows,
+            anomaly_values,
+        )
     return DownloadResult(
         requested,
         market_date,
@@ -644,6 +726,11 @@ def serialize_result(result: DownloadResult) -> dict[str, object]:
         "pages": result.pages,
         "expected_records": result.expected_records,
         "downloaded_unique_rows": result.actual_records,
+        "broker_anomaly_rows": result.broker_anomaly_rows,
+        "broker_anomaly_percent": decimal_text(
+            difference_percent(result.broker_anomaly_rows, result.expected_records)
+        ),
+        "broker_anomaly_values": list(result.broker_anomaly_values),
         "missing_rows": result.missing_records,
         "missing_rows_percent": decimal_text(
             difference_percent(result.missing_records, result.expected_records)
@@ -683,6 +770,9 @@ def write_quality_report(output_dir: Path, results: list[DownloadResult]) -> Pat
         "pages",
         "expected_records",
         "downloaded_unique_rows",
+        "broker_anomaly_rows",
+        "broker_anomaly_percent",
+        "broker_anomaly_values",
         "missing_rows",
         "missing_rows_percent",
         "expected_quantity",
@@ -706,11 +796,12 @@ def write_quality_report(output_dir: Path, results: list[DownloadResult]) -> Pat
                     **{
                         key: values[key]
                         for key in columns
-                        if key not in {"short_page_numbers"}
+                        if key not in {"short_page_numbers", "broker_anomaly_values"}
                     },
                     "short_page_numbers": ";".join(
                         str(item.page_number) for item in result.short_pages
                     ),
+                    "broker_anomaly_values": ";".join(result.broker_anomaly_values),
                 }
             )
     return path
@@ -804,6 +895,9 @@ def main() -> int:
     except ValueError as exc:
         print(f"Input error: {exc}", file=sys.stderr)
         return 2
+    except Exception:
+        logging.exception("Fatal downloader failure")
+        return 3
 
 
 if __name__ == "__main__":
