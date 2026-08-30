@@ -1,0 +1,21 @@
+name: 05D - Canonical Backfill 2023 to 2026
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canonical-backfill-2023-2026
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    uses: ./.github/workflows/_05-canonical-half-month-worker.yml
+    with:
+      start_year: "2023"
+      end_year: "2026"
+      release_tag: canonical-backfill-2023-2026-v1
+      release_title: Canonical NEPSE Floorsheets 2023-2026
+    secrets: inherit
