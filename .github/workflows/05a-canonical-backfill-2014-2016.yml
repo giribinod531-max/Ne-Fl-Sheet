@@ -1,0 +1,21 @@
+name: 05A - Canonical Backfill 2014 to 2016
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canonical-backfill-2014-2016
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    uses: ./.github/workflows/_05-canonical-half-month-worker.yml
+    with:
+      start_year: "2014"
+      end_year: "2016"
+      release_tag: canonical-backfill-2014-2016-v1
+      release_title: Canonical NEPSE Floorsheets 2014-2016
+    secrets: inherit
