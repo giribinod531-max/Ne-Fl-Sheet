@@ -1,0 +1,156 @@
+name: Canonical half-month worker
+
+on:
+  workflow_call:
+    inputs:
+      start_year:
+        required: true
+        type: string
+      end_year:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+      release_title:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    name: Build 15-day plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.create.outputs.matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Test planning and validation tools
+        run: python -m unittest discover -s tests -p 'test_online_backfill.py'
+
+      - name: Create half-month matrix
+        id: create
+        shell: bash
+        run: |
+          matrix="$(python canonical_backfill_plan.py \
+            --start-year '${{ inputs.start_year }}' \
+            --end-year '${{ inputs.end_year }}')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  download:
+    name: ${{ matrix.batch.batch_id }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        batch: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-canonical.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-canonical.txt
+
+      - name: Download and validate against Merolagani totals
+        id: scrape
+        continue-on-error: true
+        timeout-minutes: 330
+        shell: bash
+        run: |
+          python canonical_floorsheet_downloader.py \
+            --start-date '${{ matrix.batch.start_date }}' \
+            --end-date '${{ matrix.batch.end_date }}' \
+            --output-dir backfill_output \
+            --delay 1.5
+
+      - name: Independently audit canonical CSV files
+        id: audit
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          python canonical_validate_batch.py \
+            --output-dir backfill_output \
+            --start-date '${{ matrix.batch.start_date }}' \
+            --end-date '${{ matrix.batch.end_date }}'
+
+      - name: Upload half-month result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-half-${{ matrix.batch.batch_id }}
+          path: backfill_output/
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 6
+
+      - name: Enforce technical integrity after saving result
+        if: always()
+        shell: bash
+        env:
+          SCRAPE_OUTCOME: ${{ steps.scrape.outcome }}
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+        run: |
+          python -c "import json,os,pathlib,sys; p=pathlib.Path('backfill_output/validation_summary.json'); failed=999 if not p.is_file() else json.loads(p.read_text())['status_counts']['FAILED']; print(f'technical_failed_dates={failed}'); sys.exit(1 if os.environ['SCRAPE_OUTCOME'] != 'success' or os.environ['AUDIT_OUTCOME'] != 'success' or failed else 0)"
+
+  assemble:
+    name: Assemble yearly bulk ZIP files
+    if: ${{ always() && needs.plan.result == 'success' }}
+    needs:
+      - plan
+      - download
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Download every available half-month artifact
+        uses: actions/download-artifact@v5
+        with:
+          pattern: canonical-half-*
+          path: collected
+          merge-multiple: false
+
+      - name: Build one audited ZIP per year
+        run: |
+          python canonical_assemble_years.py \
+            --input-dir collected \
+            --output-dir yearly_packages \
+            --start-year '${{ inputs.start_year }}' \
+            --end-year '${{ inputs.end_year }}'
+
+      - name: Upload yearly bulk ZIP files
+        uses: actions/upload-artifact@v4
+        with:
+          name: yearly-${{ inputs.release_tag }}
+          path: yearly_packages/*.zip
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Save yearly ZIP files permanently in a GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view '${{ inputs.release_tag }}' >/dev/null 2>&1; then
+            gh release create '${{ inputs.release_tag }}' \
+              --title '${{ inputs.release_title }}' \
+              --notes 'Canonical NEPSE floorsheets. Each daily CSV has nine columns; Page is retained only in quality diagnostics.'
+          fi
+          gh release upload '${{ inputs.release_tag }}' yearly_packages/*.zip --clobber
