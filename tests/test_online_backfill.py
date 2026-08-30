@@ -53,6 +53,17 @@ class PlanTests(unittest.TestCase):
         february_second = next(row for row in plan if row["batch_id"] == "2016-02-P2")
         self.assertEqual(february_second["end_date"], "2016-02-29")
 
+    def test_worker_fails_only_for_technical_or_audit_failure(self) -> None:
+        workflow = (
+            Path(__file__).parents[1]
+            / ".github"
+            / "workflows"
+            / "_05-canonical-half-month-worker.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("SCRAPE_OUTCOME", workflow)
+        self.assertIn("AUDIT_OUTCOME", workflow)
+        self.assertIn("status_counts']['FAILED']", workflow)
+
 
 class OutputValidationTests(unittest.TestCase):
     def make_output(self, root: Path) -> None:
