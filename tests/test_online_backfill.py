@@ -6,11 +6,18 @@ import tempfile
 import unittest
 import zipfile
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 from canonical_assemble_years import assemble
 from canonical_backfill_plan import build_plan
-from canonical_validate_batch import CANONICAL_COLUMNS, ValidationError, run
+from canonical_floorsheet_downloader import Transaction, classify_quality, parse_integer
+from canonical_validate_batch import (
+    CANONICAL_COLUMNS,
+    ValidationError,
+    run,
+    validate_csv,
+)
 
 
 QUALITY_COLUMNS = [
@@ -63,6 +70,39 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("SCRAPE_OUTCOME", workflow)
         self.assertIn("AUDIT_OUTCOME", workflow)
         self.assertIn("status_counts']['FAILED']", workflow)
+        self.assertIn("logs/console.log", workflow)
+
+
+class HistoricalBrokerMarkerTests(unittest.TestCase):
+    @staticmethod
+    def transaction(number: int, buyer: str = "1") -> Transaction:
+        return Transaction(
+            transaction_no=f"202301010000{number:04d}",
+            symbol="TEST",
+            buyer=buyer,
+            seller="2",
+            quantity=1,
+            rate=Decimal("1"),
+            amount=Decimal("1"),
+            source_page=11,
+        )
+
+    def test_invalid_integer_is_a_controlled_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_integer("-")
+
+    def test_one_preserved_broker_marker_in_1000_rows_is_minor_gap(self) -> None:
+        rows = [self.transaction(number) for number in range(1, 1001)]
+        rows[0] = self.transaction(1, buyer="-")
+        status, message = classify_quality(1000, 1000, Decimal("1000"), rows, [])
+        self.assertEqual(status, "MINOR_GAP")
+        self.assertIn("broker identifier", message)
+
+    def test_broker_marker_above_point_one_percent_is_rejected(self) -> None:
+        rows = [self.transaction(number) for number in range(1, 501)]
+        rows[0] = self.transaction(1, buyer="-")
+        status, _ = classify_quality(500, 500, Decimal("500"), rows, [])
+        self.assertEqual(status, "REJECT")
 
 
 class OutputValidationTests(unittest.TestCase):
@@ -155,6 +195,18 @@ class OutputValidationTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 run(root, date(2026, 8, 20), date(2026, 8, 21))
 
+    def test_non_numeric_broker_is_preserved_and_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "2023-01-01.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(CANONICAL_COLUMNS)
+                writer.writerow(
+                    [1, "20230101000001", "TEST", "-", 2, 10, "25.5", "255", "2023-01-01"]
+                )
+            result = validate_csv(path, "2023-01-01", 1)
+            self.assertEqual(result["broker_anomaly_rows"], 1)
+
 
 class AssemblyTests(unittest.TestCase):
     def test_incomplete_year_is_explicitly_marked(self) -> None:
@@ -165,16 +217,67 @@ class AssemblyTests(unittest.TestCase):
             (batch / "quality_report.csv").write_text(
                 "requested_date,status\n2014-01-01,NOT_AVAILABLE\n", encoding="utf-8"
             )
+            (batch / "independent_validation.json").write_text(
+                json.dumps(
+                    {
+                        "result": "PASS",
+                        "status_counts": {"FAILED": 0},
+                    }
+                ),
+                encoding="utf-8",
+            )
             output = root / "yearly"
-            assemble(root / "collected", output, 2014, 2014)
+            assemble(root / "collected", output, 2014, 2014, date(2014, 12, 31))
             archive_path = output / "canonical-floorsheets-2014.zip"
             with zipfile.ZipFile(archive_path) as archive:
                 manifest = json.loads(
                     archive.read("canonical-floorsheets-2014/YEAR_MANIFEST.json")
                 )
             self.assertEqual(manifest["archive_status"], "INCOMPLETE")
-            self.assertEqual(manifest["available_half_month_batches"], 1)
+            self.assertEqual(manifest["uploaded_half_month_batches"], 1)
+            self.assertEqual(manifest["validated_half_month_batches"], 1)
             self.assertEqual(len(manifest["missing_batches"]), 23)
+
+    def test_failed_batch_is_not_accepted_into_year_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            batch = root / "collected" / "canonical-half-2026-01-P1"
+            (batch / "daily_csv").mkdir(parents=True)
+            (batch / "quality_report.csv").write_text(
+                "requested_date,status\n2026-01-01,FAILED\n", encoding="utf-8"
+            )
+            (batch / "independent_validation.json").write_text(
+                json.dumps(
+                    {
+                        "result": "PASS",
+                        "status_counts": {"FAILED": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = root / "yearly"
+            assemble(root / "collected", output, 2026, 2026, date(2026, 1, 15))
+            with zipfile.ZipFile(output / "canonical-floorsheets-2026.zip") as archive:
+                manifest = json.loads(
+                    archive.read("canonical-floorsheets-2026/YEAR_MANIFEST.json")
+                )
+            self.assertEqual(manifest["expected_half_month_batches"], 1)
+            self.assertEqual(manifest["uploaded_half_month_batches"], 1)
+            self.assertEqual(manifest["validated_half_month_batches"], 0)
+            self.assertEqual(manifest["archive_status"], "INCOMPLETE")
+            self.assertEqual(manifest["invalid_batches"][0]["batch_id"], "2026-01-P1")
+
+    def test_current_year_does_not_expect_future_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "yearly"
+            assemble(root / "collected", output, 2026, 2026, date(2026, 8, 30))
+            with zipfile.ZipFile(output / "canonical-floorsheets-2026.zip") as archive:
+                manifest = json.loads(
+                    archive.read("canonical-floorsheets-2026/YEAR_MANIFEST.json")
+                )
+            self.assertEqual(manifest["expected_half_month_batches"], 16)
+            self.assertEqual(manifest["through_date"], "2026-08-30")
 
 
 if __name__ == "__main__":
