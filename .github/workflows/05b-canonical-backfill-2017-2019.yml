@@ -1,0 +1,21 @@
+name: 05B - Canonical Backfill 2017 to 2019
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canonical-backfill-2017-2019
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    uses: ./.github/workflows/_05-canonical-half-month-worker.yml
+    with:
+      start_year: "2017"
+      end_year: "2019"
+      release_tag: canonical-backfill-2017-2019-v1
+      release_title: Canonical NEPSE Floorsheets 2017-2019
+    secrets: inherit
