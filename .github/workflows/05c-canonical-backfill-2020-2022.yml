@@ -1,0 +1,21 @@
+name: 05C - Canonical Backfill 2020 to 2022
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canonical-backfill-2020-2022
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    uses: ./.github/workflows/_05-canonical-half-month-worker.yml
+    with:
+      start_year: "2020"
+      end_year: "2022"
+      release_tag: canonical-backfill-2020-2022-v1
+      release_title: Canonical NEPSE Floorsheets 2020-2022
+    secrets: inherit
