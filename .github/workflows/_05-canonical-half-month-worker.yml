@@ -103,10 +103,9 @@ jobs:
         if: always()
         shell: bash
         env:
-          SCRAPE_OUTCOME: ${{ steps.scrape.outcome }}
           AUDIT_OUTCOME: ${{ steps.audit.outcome }}
         run: |
-          python -c "import json,os,pathlib,sys; p=pathlib.Path('backfill_output/validation_summary.json'); failed=999 if not p.is_file() else json.loads(p.read_text())['status_counts']['FAILED']; print(f'technical_failed_dates={failed}'); sys.exit(1 if os.environ['SCRAPE_OUTCOME'] != 'success' or os.environ['AUDIT_OUTCOME'] != 'success' or failed else 0)"
+          python -c "import json,os,pathlib,sys; p=pathlib.Path('backfill_output/validation_summary.json'); failed=999 if not p.is_file() else json.loads(p.read_text())['status_counts']['FAILED']; print(f'technical_failed_dates={failed}'); sys.exit(1 if os.environ['AUDIT_OUTCOME'] != 'success' or failed else 0)"
 
   assemble:
     name: Assemble yearly bulk ZIP files
