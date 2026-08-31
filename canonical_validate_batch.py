@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import re
+from collections import Counter
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -68,17 +69,34 @@ def decimal_value(value: str, label: str) -> Decimal:
         raise ValidationError(f"Invalid {label}: {value!r}.") from exc
 
 
+def amount_matches_source_display(
+    quantity: int, rate: Decimal, amount: Decimal
+) -> tuple[bool, bool, Decimal]:
+    """Accept exact amounts or Merolagani's historical 6-significant-digit rounding."""
+    calculated = Decimal(quantity) * rate
+    difference = abs(calculated - amount)
+    if difference <= Decimal("0.01"):
+        return True, False, difference
+    display_unit = Decimal(1).scaleb(calculated.adjusted() - 5)
+    allowed_difference = (display_unit / 2) + Decimal("0.01")
+    return difference <= allowed_difference, True, difference
+
+
 def broker_value_is_valid(value: str) -> bool:
     value = value.strip()
-    return bool(re.fullmatch(r"[0-9]+", value)) and int(value) > 0
+    if re.fullmatch(r"[0-9]+", value):
+        return int(value) > 0
+    return bool(re.fullmatch(r"D[0-9]{2}", value, re.IGNORECASE))
 
 
 def validate_csv(path: Path, requested: str, expected_rows: int) -> dict[str, object]:
     row_count = 0
-    transaction_ids: set[str] = set()
+    transaction_ids: list[str] = []
     total_quantity = 0
     total_amount = Decimal("0")
     broker_anomaly_rows = 0
+    source_rounded_amount_rows = 0
+    maximum_amount_rounding_difference = Decimal("0")
     expected_prefix = requested.replace("-", "")
 
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -93,9 +111,7 @@ def validate_csv(path: Path, requested: str, expected_rows: int) -> dict[str, ob
             if row["Date"] != requested:
                 raise ValidationError(f"{path.name}: wrong Date value at row {row_count}.")
             transaction_id = row["Transact. No."].strip()
-            if transaction_id in transaction_ids:
-                raise ValidationError(f"{path.name}: duplicate transaction {transaction_id}.")
-            transaction_ids.add(transaction_id)
+            transaction_ids.append(transaction_id)
             if re.fullmatch(r"\d{8,}", transaction_id) and not transaction_id.startswith(
                 expected_prefix
             ):
@@ -107,8 +123,19 @@ def validate_csv(path: Path, requested: str, expected_rows: int) -> dict[str, ob
             amount = decimal_value(row["Amount"], "amount")
             if quantity <= 0 or rate <= 0 or amount <= 0:
                 raise ValidationError(f"{path.name}: non-positive value at row {row_count}.")
-            if abs((Decimal(quantity) * rate) - amount) > Decimal("0.01"):
-                raise ValidationError(f"{path.name}: quantity × rate mismatch at row {row_count}.")
+            amount_is_valid, source_rounded, amount_difference = (
+                amount_matches_source_display(quantity, rate, amount)
+            )
+            if not amount_is_valid:
+                raise ValidationError(
+                    f"{path.name}: quantity × rate differs from Amount beyond the "
+                    f"source display precision at row {row_count}."
+                )
+            if source_rounded:
+                source_rounded_amount_rows += 1
+                maximum_amount_rounding_difference = max(
+                    maximum_amount_rounding_difference, amount_difference
+                )
             if not broker_value_is_valid(row["Buyer"]) or not broker_value_is_valid(
                 row["Seller"]
             ):
@@ -120,12 +147,25 @@ def validate_csv(path: Path, requested: str, expected_rows: int) -> dict[str, ob
         raise ValidationError(
             f"{path.name}: {row_count:,} rows, but report states {expected_rows:,}."
         )
+    transaction_id_counts = Counter(transaction_ids)
+    duplicate_transaction_id_rows = len(transaction_ids) - len(transaction_id_counts)
+    duplicate_transaction_id_values = [
+        f"{value!r} x{count:,}"
+        for value, count in sorted(transaction_id_counts.items())
+        if count > 1
+    ][:20]
     return {
         "date": requested,
         "rows": row_count,
         "quantity": total_quantity,
         "amount": str(total_amount),
         "broker_anomaly_rows": broker_anomaly_rows,
+        "source_rounded_amount_rows": source_rounded_amount_rows,
+        "maximum_amount_rounding_difference": str(
+            maximum_amount_rounding_difference
+        ),
+        "duplicate_transaction_id_rows": duplicate_transaction_id_rows,
+        "duplicate_transaction_id_values": duplicate_transaction_id_values,
     }
 
 
@@ -146,6 +186,18 @@ def run(output_dir: Path, start: date, end: date) -> dict[str, object]:
                 raise ValidationError(
                     f"{requested}: independently counted broker anomalies do not "
                     "match quality_report.csv."
+                )
+            reported_duplicates = int(
+                quality.get("duplicate_transaction_id_rows") or 0
+            )
+            if checked_result["duplicate_transaction_id_rows"] != reported_duplicates:
+                raise ValidationError(
+                    f"{requested}: independently counted duplicate transaction IDs "
+                    "do not match quality_report.csv."
+                )
+            if checked_result["duplicate_transaction_id_rows"] and status != "REJECT":
+                raise ValidationError(
+                    f"{requested}: duplicate transaction IDs require REJECT status."
                 )
             checked.append(checked_result)
         elif csv_path.exists():
@@ -170,6 +222,21 @@ def run(output_dir: Path, start: date, end: date) -> dict[str, object]:
         "validated_csv_files": len(checked),
         "validated_rows": sum(item["rows"] for item in checked),
         "broker_anomaly_rows": sum(item["broker_anomaly_rows"] for item in checked),
+        "source_rounded_amount_rows": sum(
+            item["source_rounded_amount_rows"] for item in checked
+        ),
+        "maximum_amount_rounding_difference": str(
+            max(
+                (
+                    Decimal(str(item["maximum_amount_rounding_difference"]))
+                    for item in checked
+                ),
+                default=Decimal("0"),
+            )
+        ),
+        "duplicate_transaction_id_rows": sum(
+            item["duplicate_transaction_id_rows"] for item in checked
+        ),
         "result": "PASS",
     }
 
