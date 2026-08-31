@@ -11,7 +11,12 @@ from pathlib import Path
 
 from canonical_assemble_years import assemble
 from canonical_backfill_plan import build_plan
-from canonical_floorsheet_downloader import Transaction, classify_quality, parse_integer
+from canonical_floorsheet_downloader import (
+    Transaction,
+    broker_value_is_valid,
+    classify_quality,
+    parse_integer,
+)
 from canonical_validate_batch import (
     CANONICAL_COLUMNS,
     ValidationError,
@@ -27,6 +32,12 @@ QUALITY_COLUMNS = [
     "pages",
     "expected_records",
     "downloaded_unique_rows",
+    "broker_anomaly_rows",
+    "broker_anomaly_percent",
+    "broker_anomaly_values",
+    "duplicate_transaction_id_rows",
+    "duplicate_transaction_id_percent",
+    "duplicate_transaction_id_values",
     "missing_rows",
     "missing_rows_percent",
     "expected_quantity",
@@ -90,6 +101,14 @@ class HistoricalBrokerMarkerTests(unittest.TestCase):
     def test_invalid_integer_is_a_controlled_value_error(self) -> None:
         with self.assertRaises(ValueError):
             parse_integer("-")
+
+    def test_d01_is_a_valid_nepse_dealer_code(self) -> None:
+        self.assertTrue(broker_value_is_valid("D01"))
+
+    def test_d01_does_not_create_a_quality_gap(self) -> None:
+        rows = [self.transaction(number, buyer="D01") for number in range(1, 11)]
+        status, _ = classify_quality(10, 10, Decimal("10"), rows, [])
+        self.assertEqual(status, "COMPLETE")
 
     def test_one_preserved_broker_marker_in_1000_rows_is_minor_gap(self) -> None:
         rows = [self.transaction(number) for number in range(1, 1001)]
@@ -206,6 +225,67 @@ class OutputValidationTests(unittest.TestCase):
                 )
             result = validate_csv(path, "2023-01-01", 1)
             self.assertEqual(result["broker_anomaly_rows"], 1)
+
+    def test_d01_is_preserved_as_a_valid_dealer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "2023-01-01.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(CANONICAL_COLUMNS)
+                writer.writerow(
+                    [1, "20230101000001", "TEST", "D01", 2, 10, "25.5", "255", "2023-01-01"]
+                )
+            result = validate_csv(path, "2023-01-01", 1)
+            self.assertEqual(result["broker_anomaly_rows"], 0)
+
+    def test_duplicate_transaction_ids_are_counted_not_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "2023-01-01.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(CANONICAL_COLUMNS)
+                writer.writerow(
+                    [1, "20230101000001", "AAA", 1, 2, 10, "25", "250", "2023-01-01"]
+                )
+                writer.writerow(
+                    [2, "20230101000001", "BBB", 3, 4, 20, "30", "600", "2023-01-01"]
+                )
+            result = validate_csv(path, "2023-01-01", 2)
+            self.assertEqual(result["duplicate_transaction_id_rows"], 1)
+
+    def test_historical_six_significant_digit_amount_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "2020-08-19.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(CANONICAL_COLUMNS)
+                writer.writerow(
+                    [1, "2020081901003685", "TEST", 48, 48, 55191, 251, 13852900, "2020-08-19"]
+                )
+            result = validate_csv(path, "2020-08-19", 1)
+            self.assertEqual(result["source_rounded_amount_rows"], 1)
+            self.assertEqual(result["maximum_amount_rounding_difference"], "41")
+
+    def test_amount_beyond_historical_display_precision_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "2020-08-19.csv"
+            with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(CANONICAL_COLUMNS)
+                writer.writerow(
+                    [1, "2020081901003685", "TEST", 48, 48, 55191, 251, 13852800, "2020-08-19"]
+                )
+            with self.assertRaises(ValidationError):
+                validate_csv(path, "2020-08-19", 1)
+
+    def test_duplicate_transaction_ids_force_reject(self) -> None:
+        rows = [
+            Transaction("20230101000001", "AAA", "1", "2", 10, Decimal("25"), Decimal("250"), 1),
+            Transaction("20230101000001", "BBB", "3", "4", 20, Decimal("30"), Decimal("600"), 1),
+        ]
+        status, message = classify_quality(2, 30, Decimal("850"), rows, [])
+        self.assertEqual(status, "REJECT")
+        self.assertIn("duplicate", message)
 
 
 class AssemblyTests(unittest.TestCase):
