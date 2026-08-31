@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -118,6 +119,21 @@ class DownloadResult:
         return tuple(sorted(values))
 
     @property
+    def duplicate_transaction_id_rows(self) -> int:
+        transaction_ids = [row.transaction_no for row in self.transactions]
+        return len(transaction_ids) - len(set(transaction_ids))
+
+    @property
+    def duplicate_transaction_id_values(self) -> tuple[str, ...]:
+        counts = Counter(row.transaction_no for row in self.transactions)
+        repeated = [
+            f"{value!r} x{count:,}"
+            for value, count in sorted(counts.items())
+            if count > 1
+        ]
+        return tuple(repeated[:20])
+
+    @property
     def missing_records(self) -> int:
         return self.expected_records - self.actual_records
 
@@ -157,7 +173,10 @@ def normalize_broker(value: str) -> str:
 
 def broker_value_is_valid(value: str) -> bool:
     value_text = str(value).strip()
-    return bool(re.fullmatch(r"[0-9]+", value_text)) and int(value_text) > 0
+    if re.fullmatch(r"[0-9]+", value_text):
+        return int(value_text) > 0
+    # NEPSE dealer member codes are alphanumeric; D01 is Nagarik Stock Dealer.
+    return bool(re.fullmatch(r"D[0-9]{2}", value_text, re.IGNORECASE))
 
 
 def parse_decimal(value: str) -> Decimal:
@@ -387,12 +406,6 @@ def inspect_page_position(
 
 def validate_identifiers(requested: date, transactions: list[Transaction]) -> None:
     transaction_ids = [row.transaction_no for row in transactions]
-    unique_ids = set(transaction_ids)
-    if len(unique_ids) != len(transaction_ids):
-        raise FloorsheetError(
-            f"Found {len(transaction_ids) - len(unique_ids):,} duplicate transaction IDs."
-        )
-
     expected_prefix = requested.strftime("%Y%m%d")
     date_like_ids = [value for value in transaction_ids if re.fullmatch(r"\d{8,}", value)]
     wrong_date_ids = [value for value in date_like_ids if not value.startswith(expected_prefix)]
@@ -418,6 +431,9 @@ def classify_quality(
         or not broker_value_is_valid(row.seller)
         for row in transactions
     )
+    duplicate_transaction_id_rows = len(transactions) - len(
+        {row.transaction_no for row in transactions}
+    )
     differences = (
         expected_records - actual_records,
         expected_quantity - actual_quantity,
@@ -437,8 +453,17 @@ def classify_quality(
         and amount_is_equal
         and not short_pages
         and broker_anomaly_rows == 0
+        and duplicate_transaction_id_rows == 0
     ):
         return "COMPLETE", "All rows, quantity and amount match the displayed totals."
+
+    if duplicate_transaction_id_rows:
+        return (
+            "REJECT",
+            f"The source contains {duplicate_transaction_id_rows:,} duplicate "
+            "transaction-number row(s). The original rows are preserved, but do "
+            "not use this day for exact transaction or broker analysis.",
+        )
 
     broker_anomaly_ratio = Decimal(broker_anomaly_rows) / Decimal(expected_records)
     ratios = (
@@ -634,6 +659,22 @@ def download_one_date(
             broker_anomaly_rows,
             anomaly_values,
         )
+    duplicate_transaction_id_rows = len(transactions) - len(
+        {row.transaction_no for row in transactions}
+    )
+    if duplicate_transaction_id_rows:
+        duplicate_values = Counter(row.transaction_no for row in transactions)
+        repeated = [
+            f"{value!r} x{count:,}"
+            for value, count in duplicate_values.most_common(10)
+            if count > 1
+        ]
+        logging.warning(
+            "%s | preserved %s duplicate transaction-number row(s) | values=%s",
+            requested.isoformat(),
+            duplicate_transaction_id_rows,
+            repeated,
+        )
     return DownloadResult(
         requested,
         market_date,
@@ -731,6 +772,15 @@ def serialize_result(result: DownloadResult) -> dict[str, object]:
             difference_percent(result.broker_anomaly_rows, result.expected_records)
         ),
         "broker_anomaly_values": list(result.broker_anomaly_values),
+        "duplicate_transaction_id_rows": result.duplicate_transaction_id_rows,
+        "duplicate_transaction_id_percent": decimal_text(
+            difference_percent(
+                result.duplicate_transaction_id_rows, result.expected_records
+            )
+        ),
+        "duplicate_transaction_id_values": list(
+            result.duplicate_transaction_id_values
+        ),
         "missing_rows": result.missing_records,
         "missing_rows_percent": decimal_text(
             difference_percent(result.missing_records, result.expected_records)
@@ -773,6 +823,9 @@ def write_quality_report(output_dir: Path, results: list[DownloadResult]) -> Pat
         "broker_anomaly_rows",
         "broker_anomaly_percent",
         "broker_anomaly_values",
+        "duplicate_transaction_id_rows",
+        "duplicate_transaction_id_percent",
+        "duplicate_transaction_id_values",
         "missing_rows",
         "missing_rows_percent",
         "expected_quantity",
@@ -796,12 +849,20 @@ def write_quality_report(output_dir: Path, results: list[DownloadResult]) -> Pat
                     **{
                         key: values[key]
                         for key in columns
-                        if key not in {"short_page_numbers", "broker_anomaly_values"}
+                        if key
+                        not in {
+                            "short_page_numbers",
+                            "broker_anomaly_values",
+                            "duplicate_transaction_id_values",
+                        }
                     },
                     "short_page_numbers": ";".join(
                         str(item.page_number) for item in result.short_pages
                     ),
                     "broker_anomaly_values": ";".join(result.broker_anomaly_values),
+                    "duplicate_transaction_id_values": ";".join(
+                        result.duplicate_transaction_id_values
+                    ),
                 }
             )
     return path
