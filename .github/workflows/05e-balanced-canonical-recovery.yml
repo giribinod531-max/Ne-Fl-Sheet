@@ -1,0 +1,259 @@
+name: 05E - Balanced Canonical Recovery (20 workers)
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_concurrency:
+        description: Parallel requests used only to estimate transaction workload
+        required: true
+        default: "8"
+        type: choice
+        options:
+          - "4"
+          - "6"
+          - "8"
+      download_delay:
+        description: Delay in seconds between Merolagani result pages
+        required: true
+        default: "1.5"
+        type: choice
+        options:
+          - "1.5"
+          - "2.0"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: stage-05e-balanced-recovery
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Audit baseline and balance 117 recovery batches
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      matrix: ${{ steps.create.outputs.matrix }}
+      through_date: ${{ steps.create.outputs.through_date }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-canonical.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-canonical.txt
+
+      - name: Test all canonical recovery tools
+        run: python -m unittest discover -s tests -p 'test*.py'
+
+      - name: Measure transaction workload and create 20 groups
+        id: create
+        shell: bash
+        run: |
+          python canonical_05e_plan.py \
+            --config canonical_05e_targets.json \
+            --output-dir plan_output \
+            --workers 20 \
+            --probe-concurrency '${{ inputs.probe_concurrency }}' \
+            --probe-delay 0.5 \
+            > plan_output_stdout.json
+          echo "matrix=$(cat plan_output/matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "through_date=$(python -c \"import json; print(json.load(open('canonical_05e_targets.json'))['through_date'])\")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload auditable workload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: 05e-transaction-balanced-plan
+          path: plan_output/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 6
+
+  recover:
+    name: ${{ matrix.batch.worker }} / ${{ matrix.batch.batch_id }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        batch: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-canonical.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-canonical.txt
+
+      - name: Show balanced workload assignment
+        run: |
+          echo "worker=${{ matrix.batch.worker }}"
+          echo "batch=${{ matrix.batch.batch_id }}"
+          echo "estimated_transactions=${{ matrix.batch.estimated_transactions }}"
+          echo "average_transactions_per_active_date=${{ matrix.batch.average_transactions }}"
+
+      - name: Download and reconcile against Merolagani totals
+        id: scrape
+        continue-on-error: true
+        timeout-minutes: 330
+        shell: bash
+        run: |
+          mkdir -p backfill_output/logs
+          set +e
+          python canonical_floorsheet_downloader.py \
+            --start-date '${{ matrix.batch.start_date }}' \
+            --end-date '${{ matrix.batch.end_date }}' \
+            --output-dir backfill_output \
+            --delay '${{ inputs.download_delay }}' \
+            2>&1 | tee backfill_output/logs/console.log
+          downloader_exit=${PIPESTATUS[0]}
+          exit "$downloader_exit"
+
+      - name: Independently audit canonical CSV files
+        id: audit
+        if: always()
+        continue-on-error: true
+        run: |
+          python canonical_validate_batch.py \
+            --output-dir backfill_output \
+            --start-date '${{ matrix.batch.start_date }}' \
+            --end-date '${{ matrix.batch.end_date }}'
+
+      - name: Upload this half-month result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-half-${{ matrix.batch.batch_id }}
+          path: backfill_output/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+      - name: Enforce technical integrity after saving evidence
+        if: always()
+        env:
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+        run: |
+          python -c "import json,os,pathlib,sys; p=pathlib.Path('backfill_output/validation_summary.json'); failed=999 if not p.is_file() else json.loads(p.read_text())['status_counts']['FAILED']; print(f'technical_failed_dates={failed}'); sys.exit(1 if os.environ['AUDIT_OUTCOME'] != 'success' or failed else 0)"
+
+  finalize:
+    name: Merge baseline, audit every year, and publish v2
+    if: ${{ always() && needs.plan.result == 'success' }}
+    needs:
+      - plan
+      - recover
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Download validated Stage 05C baseline
+        uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33422133338
+          pattern: canonical-half-*
+          path: baseline-05c
+          merge-multiple: false
+
+      - name: Download validated Stage 05D baseline
+        uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33415523179
+          pattern: canonical-half-*
+          path: baseline-05d
+          merge-multiple: false
+
+      - name: Download every Stage 05E recovery result
+        uses: actions/download-artifact@v5
+        with:
+          pattern: canonical-half-*
+          path: recovered
+          merge-multiple: false
+
+      - name: Merge without duplicate half-month folders
+        run: |
+          python canonical_merge_batches.py \
+            --baseline-dir baseline-05c \
+            --baseline-dir baseline-05d \
+            --recovery-dir recovered \
+            --output-dir combined \
+            --config canonical_05e_targets.json
+
+      - name: Build one audited ZIP per year
+        run: |
+          python canonical_assemble_years.py \
+            --input-dir combined \
+            --output-dir yearly_packages \
+            --start-year 2020 \
+            --end-year 2026 \
+            --through-date '${{ needs.plan.outputs.through_date }}'
+
+      - name: Final completeness audit
+        id: final_audit
+        continue-on-error: true
+        run: |
+          python canonical_verify_year_packages.py \
+            --package-dir yearly_packages \
+            --start-year 2020 \
+            --end-year 2026 \
+            --output yearly_packages/FINAL_AUDIT.json
+
+      - name: Upload yearly packages and audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yearly-canonical-backfill-2020-2026-v2
+          path: |
+            yearly_packages/*.zip
+            yearly_packages/FINAL_AUDIT.json
+            combined/MERGE_MANIFEST.json
+          if-no-files-found: warn
+          retention-days: 90
+          compression-level: 0
+
+      - name: Publish only a complete audited release
+        if: steps.final_audit.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag='canonical-backfill-2020-2026-v2'
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title 'Canonical NEPSE Floorsheets 2020-2026 v2' \
+              --notes 'Audited Stage 05E recovery. Canonical CSVs contain serial number and Date; Page remains only in diagnostics.'
+          fi
+          gh release upload "$tag" yearly_packages/*.zip yearly_packages/FINAL_AUDIT.json --clobber
+
+      - name: Stop if any year is incomplete
+        if: always()
+        env:
+          FINAL_AUDIT_OUTCOME: ${{ steps.final_audit.outcome }}
+        run: |
+          if [ "$FINAL_AUDIT_OUTCOME" != "success" ]; then
+            echo "At least one year is incomplete. Evidence was uploaded, but no final release was published."
+            exit 1
+          fi
+          echo "All seven yearly packages passed the final audit."
