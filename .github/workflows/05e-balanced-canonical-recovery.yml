@@ -54,7 +54,7 @@ jobs:
       - name: Test all canonical recovery tools
         run: python -m unittest discover -s tests -p 'test*.py'
 
-      - name: Measure transaction workload and create 20 groups
+      - name: Create immediate 20-worker recovery queue
         id: create
         shell: bash
         run: |
@@ -62,8 +62,7 @@ jobs:
             --config canonical_05e_targets.json \
             --output-dir plan_output \
             --workers 20 \
-            --probe-concurrency '${{ inputs.probe_concurrency }}' \
-            --probe-delay 0.5 \
+            --skip-probe \
             > plan_output_stdout.json
           echo "matrix=$(cat plan_output/matrix.json)" >> "$GITHUB_OUTPUT"
           python -c 'import json; print("through_date=" + json.load(open("canonical_05e_targets.json"))["through_date"])' >> "$GITHUB_OUTPUT"
