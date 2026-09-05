@@ -66,7 +66,7 @@ jobs:
             --probe-delay 0.5 \
             > plan_output_stdout.json
           echo "matrix=$(cat plan_output/matrix.json)" >> "$GITHUB_OUTPUT"
-          echo "through_date=$(python -c \"import json; print(json.load(open('canonical_05e_targets.json'))['through_date'])\")" >> "$GITHUB_OUTPUT"
+          python -c 'import json; print("through_date=" + json.load(open("canonical_05e_targets.json"))["through_date"])' >> "$GITHUB_OUTPUT"
 
       - name: Upload auditable workload plan
         uses: actions/upload-artifact@v4
